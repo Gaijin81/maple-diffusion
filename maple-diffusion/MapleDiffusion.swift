@@ -167,6 +167,137 @@ class OperationManager {
     }
 }
 
+// MARK: - Performance Optimization
+class PerformanceOptimizer {
+    static let shared = PerformanceOptimizer()
+    
+    private let memoryWarningThreshold: Int = 2 * 1024 * 1024 * 1024 // 2GB
+    private let preferredThreadCount = max(2, ProcessInfo.processInfo.processorCount - 1)
+    private let queue = DispatchQueue(label: "com.maple-diffusion.optimizer", qos: .userInitiated)
+    
+    private init() {
+        setupMemoryWarningNotification()
+    }
+    
+    private func setupMemoryWarningNotification() {
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleMemoryWarning),
+            name: UIApplication.didReceiveMemoryWarningNotification,
+            object: nil
+        )
+    }
+    
+    @objc private func handleMemoryWarning() {
+        ResourceManager.shared.clearCache()
+        OperationManager.shared.cancelAllOperations()
+    }
+    
+    func optimizeForDevice() -> DeviceConfiguration {
+        let device = MTLCreateSystemDefaultDevice()!
+        let maxMemory = device.recommendedMaxWorkingSetSize
+        let hasUnifiedMemory = device.hasUnifiedMemory
+        
+        return DeviceConfiguration(
+            maxBatchSize: calculateOptimalBatchSize(maxMemory: maxMemory),
+            threadCount: preferredThreadCount,
+            useUnifiedMemory: hasUnifiedMemory,
+            useLowMemoryMode: maxMemory < memoryWarningThreshold
+        )
+    }
+    
+    private func calculateOptimalBatchSize(maxMemory: Int) -> Int {
+        // Estimation basée sur la mémoire disponible
+        let memoryPerBatch = 512 * 1024 * 1024 // 512MB par batch
+        let theoreticalMaxBatch = maxMemory / memoryPerBatch
+        return min(4, max(1, theoreticalMaxBatch))
+    }
+    
+    func optimizeGraphForDevice(graph: MPSGraph) {
+        let config = optimizeForDevice()
+        
+        // Optimisations du graphe MPSGraph
+        if config.useUnifiedMemory {
+            graph.options = .synchronizeResults
+        }
+        
+        // Optimisations de compilation
+        let compilationDescriptor = MPSGraphCompilationDescriptor()
+        compilationDescriptor.optimizationLevel = config.useLowMemoryMode ? .size : .performance
+        graph.compile(with: compilationDescriptor)
+    }
+}
+
+// Configuration optimale pour le device
+struct DeviceConfiguration {
+    let maxBatchSize: Int
+    let threadCount: Int
+    let useUnifiedMemory: Bool
+    let useLowMemoryMode: Bool
+}
+
+// MARK: - Memory Management
+class MemoryManager {
+    static let shared = MemoryManager()
+    
+    private let memoryPool: [String: MTLBuffer] = [:]
+    private let bufferQueue = DispatchQueue(label: "com.maple-diffusion.buffer", qos: .userInitiated)
+    private var activeBuffers: Set<MTLBuffer> = []
+    
+    private init() {}
+    
+    func allocateBuffer(size: Int, device: MTLDevice) -> MTLBuffer? {
+        return bufferQueue.sync {
+            let options: MTLResourceOptions = device.hasUnifiedMemory ? .storageModeShared : .storageModePrivate
+            let buffer = device.makeBuffer(length: size, options: options)
+            if let buffer = buffer {
+                activeBuffers.insert(buffer)
+            }
+            return buffer
+        }
+    }
+    
+    func releaseBuffer(_ buffer: MTLBuffer) {
+        bufferQueue.async {
+            self.activeBuffers.remove(buffer)
+        }
+    }
+    
+    func purgeMemory() {
+        bufferQueue.async {
+            self.activeBuffers.removeAll()
+        }
+    }
+}
+
+// MARK: - Tensor Cache
+class TensorCache {
+    static let shared = TensorCache()
+    
+    private var cache: [String: MPSGraphTensorData] = [:]
+    private let cacheQueue = DispatchQueue(label: "com.maple-diffusion.tensor-cache", qos: .userInitiated)
+    
+    private init() {}
+    
+    func store(_ tensor: MPSGraphTensorData, forKey key: String) {
+        cacheQueue.async {
+            self.cache[key] = tensor
+        }
+    }
+    
+    func retrieve(forKey key: String) -> MPSGraphTensorData? {
+        return cacheQueue.sync {
+            return cache[key]
+        }
+    }
+    
+    func clear() {
+        cacheQueue.async {
+            self.cache.removeAll()
+        }
+    }
+}
+
 class MapleDiffusion {
     // Existing properties...
     private let state: DiffusionState
@@ -195,6 +326,8 @@ class MapleDiffusion {
         
         // Initialize with error handling
         initializeWithErrorHandling()
+        
+        setupOptimizations()
     }
     
     private func initializeWithErrorHandling() {
@@ -342,6 +475,70 @@ class MapleDiffusion {
             }
         default:
             errorHandler(.internalError(error.localizedDescription))
+        }
+    }
+    
+    private func setupOptimizations() {
+        let config = PerformanceOptimizer.shared.optimizeForDevice()
+        
+        // Configuration du graphe
+        let graph = MPSGraph()
+        PerformanceOptimizer.shared.optimizeGraphForDevice(graph: graph)
+        
+        // Configuration des buffers
+        if config.useLowMemoryMode {
+            ResourceManager.shared.clearCache()
+            TensorCache.shared.clear()
+        }
+    }
+    
+    private func optimizeGeneration(prompt: String, negativePrompt: String, steps: Int) -> GenerationConfiguration {
+        let config = PerformanceOptimizer.shared.optimizeForDevice()
+        
+        return GenerationConfiguration(
+            batchSize: config.maxBatchSize,
+            useHalfPrecision: config.useLowMemoryMode,
+            optimizedSteps: min(steps, config.useLowMemoryMode ? 30 : 50)
+        )
+    }
+}
+
+// Configuration pour la génération
+struct GenerationConfiguration {
+    let batchSize: Int
+    let useHalfPrecision: Bool
+    let optimizedSteps: Int
+}
+
+// MARK: - Performance Monitoring
+class PerformanceMonitor {
+    static let shared = PerformanceMonitor()
+    
+    private var metrics: [String: TimeInterval] = [:]
+    private let metricsQueue = DispatchQueue(label: "com.maple-diffusion.metrics", qos: .utility)
+    
+    private init() {}
+    
+    func startMeasuring(_ operation: String) -> CFAbsoluteTime {
+        return CFAbsoluteTimeGetCurrent()
+    }
+    
+    func stopMeasuring(_ operation: String, startTime: CFAbsoluteTime) {
+        let duration = CFAbsoluteTimeGetCurrent() - startTime
+        metricsQueue.async {
+            self.metrics[operation] = duration
+        }
+    }
+    
+    func getMetrics() -> [String: TimeInterval] {
+        return metricsQueue.sync {
+            return metrics
+        }
+    }
+    
+    func reset() {
+        metricsQueue.async {
+            self.metrics.removeAll()
         }
     }
 }
