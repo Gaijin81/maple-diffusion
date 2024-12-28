@@ -458,7 +458,7 @@ func makeDiffusionStep(graph: MPSGraph, xIn: MPSGraphTensor, etaUncondIn: MPSGra
     let predX0Unscaled = graph.subtraction(xIn, deltaX0, name: nil)
     let predX0 = graph.division(predX0Unscaled, graph.squareRoot(with: alphaIn, name: nil), name: nil)
     let dirX = graph.multiplication(makeSqrtOneMinus(graph: graph, xIn: alphaPrevIn), eta, name: nil)
-    let xPrevBase = graph.multiplication(graph.squareRoot(with: alphaPrevIn, name: nil), predX0, name:nil)
+    let xPrevBase = graph.multiplication(graph.squareRoot(with: alphaPrevIn, name:nil), predX0, name:nil)
     return graph.addition(xPrevBase, dirX, name: nil)
 }
 
@@ -472,7 +472,7 @@ class BPETokenizer {
     var bytesToUnicode = [Int:Character]()
     var ranks = [String:Int]()
     var vocab: [String:Int]
-    public init() {
+    public init() throws {
         var vocabList = [String]()
         for i in Array(33...126) + Array(161...172) + Array(174...255) {
             bytesToUnicode[i] = Character(Unicode.Scalar(i)!)
@@ -484,8 +484,31 @@ class BPETokenizer {
             vocabList.append(String(bytesToUnicode[i]!))
         }
         vocabList += vocabList.map({$0 + "</w>"})
-        let vocabFile = try! String(contentsOf: Bundle.main.url(forResource: "bins/bpe_simple_vocab_16e6", withExtension: "txt")!)
-        for (i, m) in vocabFile.split(separator: "\n")[1..<48_895].enumerated() {
+        
+        // Improved error handling for vocab file loading
+        guard let vocabURL = Bundle.main.url(forResource: "bpe_simple_vocab_16e6", withExtension: "txt", subdirectory: "bins") else {
+            throw NSError(domain: "BPETokenizer", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "Vocabulary file not found in bundle"
+            ])
+        }
+        
+        let vocabFile: String
+        do {
+            vocabFile = try String(contentsOf: vocabURL)
+        } catch {
+            throw NSError(domain: "BPETokenizer", code: 2, userInfo: [
+                NSLocalizedDescriptionKey: "Failed to read vocabulary file: \(error.localizedDescription)"
+            ])
+        }
+        
+        let vocabLines = vocabFile.split(separator: "\n")
+        guard vocabLines.count >= 48_895 else {
+            throw NSError(domain: "BPETokenizer", code: 3, userInfo: [
+                NSLocalizedDescriptionKey: "Vocabulary file is incomplete"
+            ])
+        }
+        
+        for (i, m) in vocabLines[1..<48_895].enumerated() {
             ranks[String(m)] = i
             vocabList.append(m.split(separator: " ").joined(separator: ""))
         }
@@ -506,7 +529,8 @@ class BPETokenizer {
                 if (ranks[highestRankedBigram] == nil) { break }
                 let fs = highestRankedBigram.split(separator: " ")
                 let (first, second) = (String(fs[0]), String(fs[1]))
-                var (newWord, i) = ([String](), 0)
+                var newWord = [String]()
+                var i = 0
                 while (i < word.count) {
                     let j = word[i..<word.count].firstIndex(of: first)
                     if (j == nil) {
@@ -662,7 +686,7 @@ class MapleDiffusion {
     var width: NSNumber = 64
     var height: NSNumber = 64
     
-    public init(saveMemoryButBeSlower: Bool = true) {
+    public init(saveMemoryButBeSlower: Bool = true) throws {
         saveMemory = saveMemoryButBeSlower
         device = MTLCreateSystemDefaultDevice()!
         graphDevice = MPSGraphDevice(mtlDevice: device)
@@ -670,7 +694,7 @@ class MapleDiffusion {
         shouldSynchronize = !device.hasUnifiedMemory
         
         // text tokenization
-        tokenizer = BPETokenizer()
+        tokenizer = try BPETokenizer()
         
         // time embedding
         tembGraph = makeGraph(synchonize: shouldSynchronize)
@@ -910,4 +934,3 @@ func tensorToCGImage(data: MPSGraphTensorData) -> CGImage {
     data.mpsndarray().readBytes(&imageArrayCPUBytes, strideBytes: nil)
     return CGImage(width: shape[2], height: shape[1], bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: shape[2]*shape[3], space: CGColorSpaceCreateDeviceRGB(), bitmapInfo:  CGBitmapInfo(rawValue: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.noneSkipLast.rawValue), provider: CGDataProvider(data: NSData(bytes: &imageArrayCPUBytes, length: imageArrayCPUBytes.count))!, decode: nil, shouldInterpolate: true, intent: CGColorRenderingIntent.defaultIntent)!
 }
-
