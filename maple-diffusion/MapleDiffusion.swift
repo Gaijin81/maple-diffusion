@@ -644,6 +644,37 @@ func makeAuxUpsampler(graph: MPSGraph, xIn: MPSGraphTensor) -> MPSGraphTensor {
     return makeByteConverter(graph: graph, xIn: x)
 }
 
+class MemoryPool {
+    private var bufferPool: [Int: [MTLBuffer]] = [:]
+    private let device: MTLDevice
+    private let maxBuffersPerSize = 5
+    
+    init(device: MTLDevice) {
+        self.device = device
+    }
+    
+    func getBuffer(size: Int) -> MTLBuffer? {
+        if let availableBuffers = bufferPool[size], !availableBuffers.isEmpty {
+            return availableBuffers.removeLast()
+        }
+        
+        let options: MTLResourceOptions = device.hasUnifiedMemory ? .storageModeShared : .storageModePrivate
+        return device.makeBuffer(length: size, options: options)
+    }
+    
+    func returnBuffer(_ buffer: MTLBuffer) {
+        let size = buffer.length
+        if var buffers = bufferPool[size], buffers.count < maxBuffersPerSize {
+            buffers.append(buffer)
+            bufferPool[size] = buffers
+        }
+    }
+    
+    func purge() {
+        bufferPool.removeAll()
+    }
+}
+
 class MapleDiffusion {
     let device: MTLDevice
     let graphDevice: MPSGraphDevice
@@ -664,6 +695,15 @@ class MapleDiffusion {
     // Performance optimization: Pre-allocate buffers
     private let workingHeap: MTLHeap?
     
+    // Memory pool for buffer management
+    private let memoryPool: MemoryPool
+    
+    // Set to track active buffers
+    private var activeBuffers: Set<MTLBuffer> = []
+    
+    // Memory warning threshold
+    private let memoryWarningThreshold: Int = 2 * 1024 * 1024 * 1024 // 2GB
+    
     public init(saveMemoryButBeSlower: Bool = true) throws {
         saveMemory = saveMemoryButBeSlower
         device = MTLCreateSystemDefaultDevice()!
@@ -680,6 +720,9 @@ class MapleDiffusion {
         // Initialize tokenizer
         tokenizer = try BPETokenizer()
         
+        // Initialize memory pool
+        memoryPool = MemoryPool(device: device)
+        
         // Initialize other components
         tembGraph = makeGraph(synchonize: shouldSynchronize)
         diffGraph = makeGraph(synchonize: shouldSynchronize)
@@ -689,6 +732,12 @@ class MapleDiffusion {
         
         // Initialize the rest of the components
         initializeComponents()
+        
+        // Add observer for memory warnings
+        NotificationCenter.default.addObserver(self,
+            selector: #selector(handleMemoryWarning),
+            name: UIApplication.didReceiveMemoryWarningNotification,
+            object: nil)
     }
     
     private func preWarmPipeline() {
@@ -719,79 +768,117 @@ class MapleDiffusion {
         // Libérer la mémoire non utilisée
         autoreleasepool {
             tensorCache.removeAll()
+            constantTensors.removeAll()
         }
         
         // Forcer la libération de la mémoire Metal si nécessaire
-        if device.currentAllocatedSize > 1024 * 1024 * 1024 { // Si plus de 1GB utilisé
-            device.purgeableState = .empty
+        if device.currentAllocatedSize > memoryWarningThreshold {
+            activeBuffers.forEach { releaseBuffer($0) }
         }
     }
     
-    private func reuseOrCreateTensor(withShape shape: [NSNumber], dataType: MPSDataType, name: String) -> MPSGraphTensor {
-        let key = "\(name)_\(shape)_\(dataType)"
-        if let cachedTensor = getCachedConstantTensor(forKey: key) {
-            return cachedTensor
+    @objc private func handleMemoryWarning() {
+        optimizeMemoryUsage()
+        memoryPool.purge()
+    }
+    
+    private func trackBuffer(_ buffer: MTLBuffer) {
+        activeBuffers.insert(buffer)
+    }
+    
+    private func releaseBuffer(_ buffer: MTLBuffer) {
+        activeBuffers.remove(buffer)
+        memoryPool.returnBuffer(buffer)
+    }
+    
+    private func checkMemoryUsage() {
+        if device.currentAllocatedSize > memoryWarningThreshold {
+            handleMemoryWarning()
+        }
+    }
+    
+    private func allocateOptimizedBuffer(size: Int) -> MTLBuffer? {
+        checkMemoryUsage()
+        if let buffer = memoryPool.getBuffer(size: size) {
+            trackBuffer(buffer)
+            return buffer
+        }
+        return nil
+    }
+    
+    private func optimizeMemoryForInference() {
+        // Libérer la mémoire non critique avant l'inférence
+        autoreleasepool {
+            tensorCache.removeAll()
+            constantTensors.removeAll()
         }
         
-        let tensor = graph.placeholder(shape: shape, dataType: dataType, name: name)
-        cacheConstantTensor(tensor, forKey: key)
+        // Forcer le garbage collector si nécessaire
+        if device.currentAllocatedSize > memoryWarningThreshold {
+            activeBuffers.forEach { releaseBuffer($0) }
+        }
+    }
+    
+    private func optimizeModelLoading() {
+        // Libérer les modèles non utilisés
+        if saveMemory {
+            textGuidanceExecutable = nil
+            unetAnUnexpectedJourneyExecutable = nil
+            unetTheDesolationOfSmaugExecutable = nil
+            unetTheBattleOfTheFiveArmiesExecutable = nil
+        }
+    }
+    
+    private func loadModelOptimized(completion: @escaping (Float, String) -> ()) {
+        // Charger les modèles de manière optimisée
+        autoreleasepool {
+            optimizeMemoryForInference()
+            
+            // Charger les modèles en séquence pour optimiser la mémoire
+            completion(0, "Loading text guidance...")
+            initTextGuidance()
+            
+            completion(0.25, "Loading UNet part 1/3...")
+            initAnUnexpectedJourney()
+            
+            completion(0.5, "Loading UNet part 2/3...")
+            initTheDesolationOfSmaug()
+            
+            completion(0.75, "Loading UNet part 3/3...")
+            initTheBattleOfTheFiveArmies()
+            
+            completion(1, "Models loaded")
+        }
+    }
+    
+    private func optimizeTensorAllocation(shape: [NSNumber], dataType: MPSDataType) -> MPSGraphTensor {
+        checkMemoryUsage()
+        
+        // Réutiliser un tenseur existant si possible
+        let key = "\(shape)_\(dataType)"
+        if let cachedTensor = tensorCache[key] {
+            return cachedTensor.tensor
+        }
+        
+        // Créer un nouveau tenseur avec mémoire optimisée
+        let tensor = graph.placeholder(shape: shape, dataType: dataType, name: nil)
+        if let buffer = allocateOptimizedBuffer(size: shape.reduce(1, *) * dataType.size) {
+            let tensorData = MPSGraphTensorData(device: graphDevice, buffer: buffer)
+            tensorCache[key] = tensorData
+        }
+        
         return tensor
     }
     
-    private func createOptimizedBuffer(size: Int) -> MTLBuffer? {
-        let options: MTLResourceOptions = device.hasUnifiedMemory ? .storageModeShared : .storageModePrivate
-        return workingHeap?.makeBuffer(length: size, options: options)
+    private func cleanupUnusedTensors() {
+        // Nettoyer les tenseurs qui n'ont pas été utilisés récemment
+        let currentTime = CFAbsoluteTimeGetCurrent()
+        tensorCache = tensorCache.filter { key, value in
+            if currentTime - value.lastUsed > 60 { // 1 minute timeout
+                releaseBuffer(value.buffer)
+                return false
+            }
+            return true
+        }
     }
-    
-    private func optimizeTensorOperations(graph: MPSGraph) -> MPSGraph {
-        // Configurer les options d'optimisation du graphe
-        let optimizationOptions = MPSGraphOptions()
-        optimizationOptions.optimizationLevel = .level3 // Niveau maximum d'optimisation
-        optimizationOptions.enableConcurrency = true
-        optimizationOptions.preferredDeviceType = .gpu
-        
-        // Appliquer les optimisations au graphe
-        graph.optimizationInfo = optimizationOptions
-        
-        return graph
-    }
-    
-    private func createOptimizedGraph() -> MPSGraph {
-        let graph = MPSGraph()
-        
-        // Configurer les options de performance
-        let options = MPSGraphOptions()
-        options.optimizationLevel = .level3
-        options.enableConcurrency = true
-        options.preferredDeviceType = .gpu
-        
-        // Définir la stratégie de fusion des opérations
-        graph.fusionStrategy = .aggressive
-        
-        // Activer le mode de performance maximale
-        graph.enableHighPerformanceMode = true
-        
-        return optimizeTensorOperations(graph: graph)
-    }
-    
-    private func optimizeGraphExecution(executable: MPSGraphExecutable) {
-        // Configurer l'exécution pour de meilleures performances
-        let executionDescriptor = MPSGraphExecutionDescriptor()
-        executionDescriptor.schedulingMode = .concurrent
-        executionDescriptor.waitForCompletion = false
-        executionDescriptor.enableProfiling = false
-        
-        // Appliquer les optimisations
-        executable.optimizationInfo.optimizationLevel = .level3
-        executable.optimizationInfo.enableConcurrency = true
-    }
-    
-    // ... rest of the class remains the same ...
-}
-
-func tensorToCGImage(data: MPSGraphTensorData) -> CGImage {
-    let shape = data.shape.map{$0.intValue}
-    var imageArrayCPUBytes = [UInt8](repeating: 0, count: shape.reduce(1, *))
-    data.mpsndarray().readBytes(&imageArrayCPUBytes, strideBytes: nil)
-    return CGImage(width: shape[2], height: shape[1], bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: shape[2]*shape[3], space: CGColorSpaceCreateDeviceRGB(), bitmapInfo:  CGBitmapInfo(rawValue: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.noneSkipLast.rawValue), provider: CGDataProvider(data: NSData(bytes: &imageArrayCPUBytes, length: imageArrayCPUBytes.count))!, decode: nil, shouldInterpolate: true, intent: CGColorRenderingIntent.defaultIntent)!
-}
+{{ ... }}
